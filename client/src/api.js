@@ -22,4 +22,6 @@ export const api = {
   simulate: (contextId, buffer) =>
     request(`/simulate/${contextId}`, { method: 'POST', body: JSON.stringify({ buffer }) }),
   regressionSuite: () => request('/regression-suite'),
+  sandboxPreview: (draft) =>
+    request('/sandbox/preview', { method: 'POST', body: JSON.stringify(draft) }),
 };

@@ -783,6 +783,154 @@ kbd.press {
   color: #b8c7e8;
 }
 
+/* ---------- 变更沙盒 ---------- */
+.sandbox-page .panel {
+  overflow: hidden;
+}
+.sandbox-stage {
+  display: flex;
+  flex-direction: column;
+}
+.sandbox-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 12px 14px 0;
+}
+select {
+  width: 100%;
+  background: #101725;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--text);
+  padding: 7px 10px;
+  font-size: 13px;
+}
+select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.sandbox-add-form {
+  border-bottom: 1px solid var(--border);
+}
+.sandbox-notice {
+  margin: 0;
+  padding: 8px 12px;
+  border: 1px solid rgba(91, 157, 255, 0.5);
+  border-radius: 8px;
+  background: rgba(91, 157, 255, 0.1);
+  font-size: 12.5px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.draft-list {
+  list-style: none;
+  margin: 0;
+  padding: 10px 14px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.draft-op {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  background: rgba(0, 0, 0, 0.16);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 10px;
+}
+.draft-op button {
+  margin-left: auto;
+}
+.role-tag.draft-add {
+  background: rgba(62, 207, 142, 0.12);
+  color: var(--ok);
+  border-color: rgba(62, 207, 142, 0.4);
+}
+.role-tag.draft-update {
+  background: rgba(245, 181, 68, 0.1);
+  color: var(--warn);
+  border-color: rgba(245, 181, 68, 0.4);
+}
+.role-tag.draft-delete {
+  background: rgba(240, 107, 122, 0.12);
+  color: #ff9aa5;
+  border-color: rgba(240, 107, 122, 0.5);
+}
+.sandbox-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 12px 14px 14px;
+}
+.diff-sections {
+  padding: 10px 14px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.diff-section h4 {
+  margin: 2px 0 6px;
+  font-size: 12.5px;
+}
+.diff-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.diff-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  border: 1px solid;
+  border-radius: 8px;
+  padding: 6px 10px;
+}
+.diff-item.appeared {
+  background: rgba(62, 207, 142, 0.07);
+  border-color: rgba(62, 207, 142, 0.35);
+}
+.diff-item.disappeared {
+  background: rgba(240, 107, 122, 0.07);
+  border-color: rgba(240, 107, 122, 0.4);
+}
+.diff-sign {
+  font-weight: 700;
+  width: 16px;
+  text-align: center;
+  flex-shrink: 0;
+}
+.diff-item.appeared .diff-sign,
+.diff-sign.plus {
+  color: var(--ok);
+}
+.diff-item.disappeared .diff-sign,
+.diff-sign.minus {
+  color: var(--danger);
+}
+.diff-sign.tilde {
+  color: var(--warn);
+}
+.badge.draft {
+  color: var(--accent);
+  border-color: rgba(91, 157, 255, 0.5);
+  background: rgba(91, 157, 255, 0.12);
+}
+.conflict-parties-inline {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+}
+
 /* ---------- 响应式 ---------- */
 @media (max-width: 1200px) {
   .layout {

@@ -6,6 +6,7 @@ const {
   generateRegressionSuite,
   minimumSetCover,
   conflictGoalId,
+  previewSandbox,
 } = require('../src/engine');
 
 let passed = 0;
@@ -271,6 +272,192 @@ test('conflictGoalId：参与命令集合相同即同一冲突身份', () => {
   };
   assert.equal(conflictGoalId(pre1), conflictGoalId(pre2));
   assert.notEqual(conflictGoalId(pre1), conflictGoalId(dup1));
+});
+
+// ---------- 变更沙盒预演 ----------
+// 结构：R → A → B（B 为唯一叶子）；m1(R,S) 在 B 被 m2(A,S) 覆盖 => 基线不可触发
+const sandboxState = {
+  contexts: [
+    { id: 'r', parentId: null, name: 'R' },
+    { id: 'a', parentId: 'r', name: 'A' },
+    { id: 'b', parentId: 'a', name: 'B' },
+  ],
+  commands: [
+    { id: 'm1', contextId: 'r', name: 'root-save', sequenceTokens: ['s'], sequenceLabel: 'S', description: '' },
+    { id: 'm2', contextId: 'a', name: 'a-save', sequenceTokens: ['s'], sequenceLabel: 'S', description: '' },
+    { id: 'm3', contextId: 'a', name: 'a-jump', sequenceTokens: ['j'], sequenceLabel: 'J', description: '' },
+  ],
+};
+
+test('沙盒预演：空草案与基线完全一致', () => {
+  const res = previewSandbox(sandboxState, {});
+  assert.equal(res.stats.totalChanges, 0);
+  assert.equal(res.contexts.length, 0);
+  assert.equal(res.unreachable.appeared.length, 0);
+  assert.equal(res.unreachable.disappeared.length, 0);
+});
+
+test('沙盒预演：删除命令后祖先绑定恢复生效，按上下文汇总', () => {
+  const res = previewSandbox(sandboxState, { deletes: ['m2'] });
+  const ctxB = res.contexts.find((c) => c.contextId === 'b');
+  assert.ok(ctxB, 'B 应有变化');
+  // m2 的生效绑定消失，m1 从 shadowed 变为生效
+  assert.ok(ctxB.effective.disappeared.some((e) => e.commandId === 'm2'));
+  assert.ok(ctxB.effective.appeared.some((e) => e.commandId === 'm1'));
+  assert.ok(ctxB.shadowed.disappeared.some((e) => e.commandId === 'm1'));
+  // 差异条目携带来源路径与最短触发输入
+  const m1 = ctxB.effective.appeared.find((e) => e.commandId === 'm1');
+  assert.equal(m1.contextPath, 'R');
+  assert.equal(m1.shortestLabel, 'S');
+  // 被删除命令的条目标记草案来源
+  assert.equal(ctxB.effective.disappeared.find((e) => e.commandId === 'm2').draftOp, 'delete');
+  // A 层同样受影响，R 层无变化
+  assert.ok(res.contexts.some((c) => c.contextId === 'a'));
+  assert.ok(!res.contexts.some((c) => c.contextId === 'r'));
+});
+
+test('沙盒预演：新增命令在目标上下文及后代生效，不影响祖先', () => {
+  const res = previewSandbox(sandboxState, {
+    adds: [{ draftId: 'd1', contextId: 'a', name: 'new-cmd', sequence: 'n' }],
+  });
+  const ctxA = res.contexts.find((c) => c.contextId === 'a');
+  const item = ctxA.effective.appeared.find((e) => e.commandId === 'd1');
+  assert.equal(item.draftOp, 'add');
+  assert.equal(item.contextPath, 'R / A');
+  assert.equal(item.shortestLabel, 'N');
+  assert.ok(res.contexts.some((c) => c.contextId === 'b'), '后代 B 同样生效');
+  assert.ok(!res.contexts.some((c) => c.contextId === 'r'), '祖先 R 不受影响');
+});
+
+test('沙盒预演：改序列引发绑定与冲突的新增/消失', () => {
+  // m3: J → S，与 m2 构成同层重复；原 J 绑定消失
+  const res = previewSandbox(sandboxState, { updates: [{ commandId: 'm3', sequence: 's' }] });
+  const ctxA = res.contexts.find((c) => c.contextId === 'a');
+  assert.ok(ctxA.effective.disappeared.some((e) => e.commandId === 'm3' && e.sequenceLabel === 'J'));
+  assert.ok(ctxA.effective.appeared.some((e) => e.commandId === 'm3' && e.sequenceLabel === 'S'));
+  assert.equal(ctxA.effective.appeared.find((e) => e.commandId === 'm3').draftOp, 'update');
+  // 同层重复冲突 {m2, m3} 新增，冲突条目带来源与最短触发输入
+  assert.equal(ctxA.duplicate.appeared.length, 1);
+  const dup = ctxA.duplicate.appeared[0];
+  assert.deepEqual(dup.parties.map((p) => p.commandId), ['m2', 'm3']); // 参与方按 id 稳定排序
+  assert.ok(dup.parties.every((p) => p.contextPath && p.shortestLabel === 'S'));
+});
+
+test('沙盒预演：冲突以参与命令集合配对，集合不变则不计差异', () => {
+  const st = {
+    contexts: [{ id: 'r', parentId: null, name: 'R' }],
+    commands: [
+      { id: 'd1', contextId: 'r', name: 'x1', sequenceTokens: ['x'], sequenceLabel: 'X', description: '' },
+      { id: 'd2', contextId: 'r', name: 'x2', sequenceTokens: ['x'], sequenceLabel: 'X', description: '' },
+      { id: 'q1', contextId: 'r', name: 'q', sequenceTokens: ['q'], sequenceLabel: 'Q', description: '' },
+    ],
+  };
+  // 只改无关命令 => 已有同层重复 {d1,d2} 不计为差异
+  const res = previewSandbox(st, { updates: [{ commandId: 'q1', sequence: 'w' }] });
+  const ctxR = res.contexts.find((c) => c.contextId === 'r');
+  assert.equal(ctxR.duplicate.appeared.length, 0);
+  assert.equal(ctxR.duplicate.disappeared.length, 0);
+  // 加入第三条同序列命令 => 冲突身份变化：旧集合消失、新集合出现
+  const res2 = previewSandbox(st, { adds: [{ draftId: 'd3', contextId: 'r', name: 'x3', sequence: 'x' }] });
+  const ctx2 = res2.contexts.find((c) => c.contextId === 'r');
+  assert.deepEqual(ctx2.duplicate.disappeared.map((c) => c.goalId), ['dup:d1,d2']);
+  assert.deepEqual(ctx2.duplicate.appeared.map((c) => c.goalId), ['dup:d1,d2,d3']);
+});
+
+test('沙盒预演：前缀冲突按参与命令集合配对（角色不变即同一冲突）', () => {
+  const st = {
+    contexts: [{ id: 'r', parentId: null, name: 'R' }],
+    commands: [
+      { id: 'p1', contextId: 'r', name: 'pre', sequenceTokens: ['j'], sequenceLabel: 'J', description: '' },
+      { id: 'p2', contextId: 'r', name: 'ext', sequenceTokens: ['j', 'k'], sequenceLabel: 'J K', description: '' },
+    ],
+  };
+  // 延伸方序列细节变化但参与集合与角色不变 => 同一冲突身份，不计差异
+  const same = previewSandbox(st, { updates: [{ commandId: 'p2', sequence: 'j l' }] });
+  const ctxR = same.contexts.find((c) => c.contextId === 'r');
+  assert.equal(ctxR.prefix.appeared.length, 0);
+  assert.equal(ctxR.prefix.disappeared.length, 0);
+  // 前缀方改走 => 冲突消失
+  const gone = previewSandbox(st, { updates: [{ commandId: 'p1', sequence: 'h' }] });
+  const ctxR2 = gone.contexts.find((c) => c.contextId === 'r');
+  assert.deepEqual(ctxR2.prefix.disappeared.map((c) => c.goalId), ['pre:p1::p2']);
+  assert.equal(ctxR2.prefix.appeared.length, 0);
+});
+
+test('沙盒预演：不可触发命令的新增与消失', () => {
+  // 基线：m1 在唯一叶子 B 被 m2 覆盖 => 不可触发；删除 m2 后恢复可触发
+  const res = previewSandbox(sandboxState, { deletes: ['m2'] });
+  assert.deepEqual(res.unreachable.disappeared.map((u) => u.commandId), ['m1']);
+  assert.equal(res.unreachable.appeared.length, 0);
+  // 反向：在 B 新增同序列命令 => m2 变为不可触发（附原因）
+  const res2 = previewSandbox(sandboxState, {
+    adds: [{ draftId: 'x1', contextId: 'b', name: 'b-save', sequence: 's' }],
+  });
+  const m2 = res2.unreachable.appeared.find((u) => u.commandId === 'm2');
+  assert.ok(m2, 'm2 应变为不可触发');
+  assert.match(m2.reason, /覆盖/);
+  assert.equal(m2.contextPath, 'R / A');
+});
+
+test('沙盒预演：结果与数据顺序、草案操作顺序无关', () => {
+  const draft = {
+    adds: [
+      { draftId: 'n1', contextId: 'a', name: 'n1', sequence: 'n' },
+      { draftId: 'n2', contextId: 'b', name: 'n2', sequence: 'm' },
+    ],
+    updates: [{ commandId: 'm3', sequence: 'u' }],
+    deletes: ['m2'],
+  };
+  const r1 = previewSandbox(sandboxState, draft);
+  // 打乱：上下文顺序、命令顺序、草案内操作顺序全部颠倒
+  const shuffled = {
+    contexts: [...sandboxState.contexts].reverse(),
+    commands: [...sandboxState.commands].reverse(),
+  };
+  const draft2 = {
+    deletes: ['m2'],
+    updates: [{ commandId: 'm3', sequence: 'u' }],
+    adds: [
+      { draftId: 'n2', contextId: 'b', name: 'n2', sequence: 'm' },
+      { draftId: 'n1', contextId: 'a', name: 'n1', sequence: 'n' },
+    ],
+  };
+  const r2 = previewSandbox(shuffled, draft2);
+  const strip = (r) => {
+    const { generatedAt, ...rest } = r;
+    return rest;
+  };
+  assert.deepEqual(strip(r1), strip(r2));
+});
+
+test('沙盒预演：非法草案被拒绝', () => {
+  assert.throws(
+    () => previewSandbox(sandboxState, { updates: [{ commandId: 'm3', sequence: 'a b c d' }] }),
+    /新序列无效/,
+  );
+  assert.throws(() => previewSandbox(sandboxState, { deletes: ['nope'] }), /不存在/);
+  assert.throws(
+    () => previewSandbox(sandboxState, { deletes: ['m2'], updates: [{ commandId: 'm2', sequence: 'x' }] }),
+    /已在草案中删除/,
+  );
+  assert.throws(
+    () => previewSandbox(sandboxState, { adds: [{ draftId: 'm1', contextId: 'a', name: 'x', sequence: 'x' }] }),
+    /重复/,
+  );
+  assert.throws(
+    () => previewSandbox(sandboxState, { adds: [{ draftId: 'z', contextId: 'nope', name: 'x', sequence: 'x' }] }),
+    /上下文不存在/,
+  );
+});
+
+test('沙盒预演：纯内存计算，不修改基线状态', () => {
+  const before = JSON.stringify(sandboxState);
+  previewSandbox(sandboxState, {
+    adds: [{ draftId: 'n1', contextId: 'a', name: 'n1', sequence: 'n' }],
+    updates: [{ commandId: 'm3', sequence: 'u' }],
+    deletes: ['m2'],
+  });
+  assert.equal(JSON.stringify(sandboxState), before);
 });
 
 console.log(`\n引擎测试全部通过：${passed} 项`);

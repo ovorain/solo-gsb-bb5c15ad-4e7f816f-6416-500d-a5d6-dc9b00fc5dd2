@@ -518,14 +518,11 @@ function minimumSetCover(candidates, universe) {
 }
 
 /**
- * 回归套件生成：
- * 1. 以全部叶子上下文为候选，复用 computeEffective 的生效规则；
- * 2. 测试目标 = 每条可在某个叶子触发的命令 + 每个可在某个叶子观察到的
- *    同层重复（duplicate）/ 前缀冲突（prefix），冲突以参与命令集合判定身份；
- * 3. 精确集合覆盖选出叶子数量最少的套件，同解按上下文路径字典序稳定选择；
- * 4. 任何叶子都无法触发的命令列入 unreachableCommands 并给出原因，不计入覆盖。
+ * 叶子分析：在全部叶子上下文上复用 computeEffective 的生效规则，
+ * 汇总每条命令可触发的叶子、被覆盖的位置（shadower）与叶子可见冲突
+ * （冲突以参与命令集合判定身份）。供回归套件与变更沙盒预演共用。
  */
-function generateRegressionSuite(state) {
+function analyzeLeaves(state) {
   const index = buildIndex(state.contexts);
   const leaves = [...index.byId.values()]
     .filter((c) => c.children.length === 0)
@@ -558,8 +555,15 @@ function generateRegressionSuite(state) {
       if (!conflictGoals.has(goalId)) conflictGoals.set(goalId, c);
     }
   }
+  return { index, leaves, reviews, triggerLeafIds, shadowerCounter, conflictGoals };
+}
 
-  // 不可触发命令：不在任何叶子生效的命令，单列原因且不计入覆盖目标
+/**
+ * 不可触发命令：不在任何叶子生效的命令，单列原因与覆盖位置。
+ * analysis 可选，传入 analyzeLeaves 的结果以避免重复计算。
+ */
+function listUnreachableCommands(state, analysis) {
+  const { index, triggerLeafIds, shadowerCounter } = analysis || analyzeLeaves(state);
   const unreachableCommands = [];
   for (const cmd of state.commands) {
     if (triggerLeafIds.has(cmd.id)) continue;
@@ -601,6 +605,23 @@ function generateRegressionSuite(state) {
         ? -1
         : 1,
   );
+  return unreachableCommands;
+}
+
+/**
+ * 回归套件生成：
+ * 1. 以全部叶子上下文为候选，复用 computeEffective 的生效规则；
+ * 2. 测试目标 = 每条可在某个叶子触发的命令 + 每个可在某个叶子观察到的
+ *    同层重复（duplicate）/ 前缀冲突（prefix），冲突以参与命令集合判定身份；
+ * 3. 精确集合覆盖选出叶子数量最少的套件，同解按上下文路径字典序稳定选择；
+ * 4. 任何叶子都无法触发的命令列入 unreachableCommands 并给出原因，不计入覆盖。
+ */
+function generateRegressionSuite(state) {
+  const analysis = analyzeLeaves(state);
+  const { leaves, reviews, triggerLeafIds, conflictGoals } = analysis;
+
+  // 不可触发命令：不在任何叶子生效的命令，单列原因且不计入覆盖目标
+  const unreachableCommands = listUnreachableCommands(state, analysis);
 
   // 覆盖目标全集：可触发命令 + 叶子可见冲突
   const universe = new Set();
@@ -697,6 +718,274 @@ function pressToPretty(token) {
     .join('+');
 }
 
+/* ================= 变更沙盒预演 ================= */
+
+/**
+ * 把草案（新增 / 改序列 / 删除）应用到状态副本上，返回模拟状态。
+ * 纯内存计算：不触碰持久化数据，也不修改传入的 baseState；
+ * 所有校验失败均抛出 400，保证非法草案不会产生任何副作用。
+ *
+ * draft = {
+ *   adds:    [{ draftId?, contextId, name, sequence, description? }]
+ *   updates: [{ commandId, sequence }]      // 仅改序列
+ *   deletes: [commandId, ...]               // 也接受 { commandId }
+ * }
+ */
+function applyDraft(baseState, draft) {
+  const d = draft || {};
+  const adds = Array.isArray(d.adds) ? d.adds : [];
+  const updates = Array.isArray(d.updates) ? d.updates : [];
+  const deletes = Array.isArray(d.deletes) ? d.deletes : [];
+
+  const bad = (message) => Object.assign(new Error(message), { status: 400 });
+
+  const contexts = baseState.contexts.map((c) => ({ ...c }));
+  const contextIds = new Set(contexts.map((c) => c.id));
+  let commands = baseState.commands.map((c) => ({ ...c, sequenceTokens: [...c.sequenceTokens] }));
+
+  const draftOps = new Map(); // commandId -> 'add' | 'update' | 'delete'
+
+  // 1) 删除
+  const deletedIds = new Set();
+  for (const raw of deletes) {
+    const id = typeof raw === 'string' ? raw : raw && raw.commandId;
+    if (!id) throw bad('删除操作缺少命令 id');
+    if (deletedIds.has(id)) throw bad(`草案中重复删除同一命令：${id}`);
+    if (!commands.some((c) => c.id === id)) throw bad(`要删除的命令不存在：${id}`);
+    deletedIds.add(id);
+    draftOps.set(id, 'delete');
+  }
+  commands = commands.filter((c) => !deletedIds.has(c.id));
+
+  // 2) 改序列
+  const updatedIds = new Set();
+  for (const u of updates) {
+    if (!u || typeof u.commandId !== 'string' || !u.commandId) {
+      throw bad('改序列操作缺少 commandId');
+    }
+    const id = u.commandId;
+    if (deletedIds.has(id)) throw bad(`命令 ${id} 已在草案中删除，不能再修改序列`);
+    if (updatedIds.has(id)) throw bad(`草案中重复修改同一命令的序列：${id}`);
+    const cmd = commands.find((c) => c.id === id);
+    if (!cmd) throw bad(`要修改序列的命令不存在：${id}`);
+    const parsed = parseSequence(u.sequence);
+    if (!parsed.ok) throw bad(`命令「${cmd.name}」的新序列无效：${parsed.error}`);
+    cmd.sequenceRaw = String(u.sequence);
+    cmd.sequenceTokens = parsed.tokens;
+    cmd.sequenceLabel = parsed.label;
+    updatedIds.add(id);
+    draftOps.set(id, 'update');
+  }
+
+  // 3) 新增（draftId 由前端生成并在草案内保持稳定；缺省时按位置生成）
+  const addedIds = new Set();
+  adds.forEach((a, i) => {
+    if (!a || typeof a !== 'object') throw bad('新增操作格式不正确');
+    const draftId =
+      typeof a.draftId === 'string' && a.draftId.trim() ? a.draftId.trim() : `draft-add-${i + 1}`;
+    if (addedIds.has(draftId) || commands.some((c) => c.id === draftId)) {
+      throw bad(`新增命令的 id 与现有命令或草案重复：${draftId}`);
+    }
+    if (!contextIds.has(a.contextId)) throw bad(`新增命令的上下文不存在：${a.contextId}`);
+    if (!a.name || !String(a.name).trim()) throw bad('新增命令的名称不能为空');
+    const parsed = parseSequence(a.sequence);
+    if (!parsed.ok) {
+      throw bad(`新增命令「${String(a.name).trim()}」的序列无效：${parsed.error}`);
+    }
+    addedIds.add(draftId);
+    draftOps.set(draftId, 'add');
+    commands.push({
+      id: draftId,
+      contextId: a.contextId,
+      name: String(a.name).trim(),
+      description: String(a.description || ''),
+      sequenceRaw: String(a.sequence),
+      sequenceTokens: parsed.tokens,
+      sequenceLabel: parsed.label,
+    });
+  });
+
+  return {
+    state: { contexts, commands },
+    draftOps,
+    summary: {
+      adds: addedIds.size,
+      updates: updatedIds.size,
+      deletes: deletedIds.size,
+      addedCommandIds: [...addedIds].sort(),
+      updatedCommandIds: [...updatedIds].sort(),
+      deletedCommandIds: [...deletedIds].sort(),
+    },
+  };
+}
+
+/** 以稳定身份对两个列表做「新增 / 消失」配对（身份由 identityOf 给出） */
+function diffByIdentity(baseItems, simItems, identityOf) {
+  const baseKeys = new Set(baseItems.map(identityOf));
+  const simKeys = new Set(simItems.map(identityOf));
+  return {
+    appeared: simItems.filter((item) => !baseKeys.has(identityOf(item))),
+    disappeared: baseItems.filter((item) => !simKeys.has(identityOf(item))),
+  };
+}
+
+/**
+ * 变更沙盒预演：
+ * 1. 在同一份草案上分别计算基线（当前状态）与模拟状态（应用草案后的内存副本）；
+ * 2. 按上下文汇总生效绑定 / shadowed / duplicate / prefix 的新增与消失；
+ *    不可触发命令为全局汇总（定义位置随条目给出）；
+ * 3. 绑定以「命令 + 序列」配对，冲突以参与命令集合的稳定身份（conflictGoalId）配对；
+ *    全部输出按稳定键排序，结果与数据顺序、草案操作顺序无关。
+ */
+function previewSandbox(baseState, draft) {
+  const { state: simState, draftOps, summary } = applyDraft(baseState, draft);
+
+  const simIndex = buildIndex(simState.contexts);
+  const contextIds = [...simIndex.byId.keys()];
+
+  // 绑定身份：同一命令绑定到同一序列视为同一绑定（改序列 => 旧绑定消失 + 新绑定出现）
+  const bindingIdentity = (e) => `${e.commandId}\n${e.sequenceTokens.join('\n')}`;
+  const byBinding = (a, b) =>
+    a.sequenceLabel.localeCompare(b.sequenceLabel) ||
+    (a.commandId < b.commandId ? -1 : a.commandId > b.commandId ? 1 : 0);
+  const byGoalId = (a, b) => (a.goalId < b.goalId ? -1 : a.goalId > b.goalId ? 1 : 0);
+
+  const toBindingItem = (e) => ({
+    commandId: e.commandId,
+    name: e.name,
+    description: e.description || '',
+    contextId: e.contextId,
+    contextPath: e.contextPath,
+    sequenceTokens: e.sequenceTokens,
+    sequenceLabel: e.sequenceLabel,
+    shortestLabel: e.sequenceLabel, // 绑定条目的最短触发输入即其序列本身
+    state: e.state,
+    shadowedBy: e.shadowedBy || null,
+    draftOp: draftOps.get(e.commandId) || null,
+  });
+
+  const toConflictItem = (c) => ({
+    ...c,
+    goalId: conflictGoalId(c),
+    parties: c.parties
+      .map((p) => ({ ...p, draftOp: draftOps.get(p.commandId) || null }))
+      .sort((a, b) => (a.commandId < b.commandId ? -1 : a.commandId > b.commandId ? 1 : 0)),
+  });
+
+  const contextDiffs = [];
+  for (const contextId of contextIds) {
+    const baseEff = computeEffective(baseState, contextId);
+    const simEff = computeEffective(simState, contextId);
+
+    const effective = diffByIdentity(
+      baseEff.entries.filter((e) => e.state !== 'shadowed').map(toBindingItem),
+      simEff.entries.filter((e) => e.state !== 'shadowed').map(toBindingItem),
+      bindingIdentity,
+    );
+    const shadowed = diffByIdentity(
+      baseEff.entries.filter((e) => e.state === 'shadowed').map(toBindingItem),
+      simEff.entries.filter((e) => e.state === 'shadowed').map(toBindingItem),
+      bindingIdentity,
+    );
+    const conflicts = diffByIdentity(
+      baseEff.conflicts.map(toConflictItem),
+      simEff.conflicts.map(toConflictItem),
+      (c) => c.goalId,
+    );
+
+    const duplicate = {
+      appeared: conflicts.appeared.filter((c) => c.type === 'duplicate').sort(byGoalId),
+      disappeared: conflicts.disappeared.filter((c) => c.type === 'duplicate').sort(byGoalId),
+    };
+    const prefix = {
+      appeared: conflicts.appeared.filter((c) => c.type === 'prefix').sort(byGoalId),
+      disappeared: conflicts.disappeared.filter((c) => c.type === 'prefix').sort(byGoalId),
+    };
+    effective.appeared.sort(byBinding);
+    effective.disappeared.sort(byBinding);
+    shadowed.appeared.sort(byBinding);
+    shadowed.disappeared.sort(byBinding);
+
+    const changeCount =
+      effective.appeared.length +
+      effective.disappeared.length +
+      shadowed.appeared.length +
+      shadowed.disappeared.length +
+      duplicate.appeared.length +
+      duplicate.disappeared.length +
+      prefix.appeared.length +
+      prefix.disappeared.length;
+
+    if (changeCount > 0) {
+      contextDiffs.push({
+        contextId,
+        contextPath: simEff.contextPath,
+        changeCount,
+        effective,
+        shadowed,
+        duplicate,
+        prefix,
+      });
+    }
+  }
+  contextDiffs.sort((a, b) =>
+    a.contextPath === b.contextPath
+      ? a.contextId < b.contextId
+        ? -1
+        : 1
+      : a.contextPath < b.contextPath
+        ? -1
+        : 1,
+  );
+
+  // 不可触发命令：全局（任何叶子都无法触发），按 commandId 配对
+  const withDraftOp = (u) => ({ ...u, draftOp: draftOps.get(u.commandId) || null });
+  const unreachableRaw = diffByIdentity(
+    listUnreachableCommands(baseState),
+    listUnreachableCommands(simState),
+    (u) => u.commandId,
+  );
+  const unreachable = {
+    appeared: unreachableRaw.appeared.map(withDraftOp),
+    disappeared: unreachableRaw.disappeared.map(withDraftOp),
+  };
+
+  const sum = (sel) => contextDiffs.reduce((n, c) => n + sel(c).length, 0);
+  const stats = {
+    contextCount: contextIds.length,
+    changedContextCount: contextDiffs.length,
+    effectiveAppeared: sum((c) => c.effective.appeared),
+    effectiveDisappeared: sum((c) => c.effective.disappeared),
+    shadowedAppeared: sum((c) => c.shadowed.appeared),
+    shadowedDisappeared: sum((c) => c.shadowed.disappeared),
+    duplicateAppeared: sum((c) => c.duplicate.appeared),
+    duplicateDisappeared: sum((c) => c.duplicate.disappeared),
+    prefixAppeared: sum((c) => c.prefix.appeared),
+    prefixDisappeared: sum((c) => c.prefix.disappeared),
+    unreachableAppeared: unreachable.appeared.length,
+    unreachableDisappeared: unreachable.disappeared.length,
+  };
+  stats.totalChanges =
+    stats.effectiveAppeared +
+    stats.effectiveDisappeared +
+    stats.shadowedAppeared +
+    stats.shadowedDisappeared +
+    stats.duplicateAppeared +
+    stats.duplicateDisappeared +
+    stats.prefixAppeared +
+    stats.prefixDisappeared +
+    stats.unreachableAppeared +
+    stats.unreachableDisappeared;
+
+  return {
+    generatedAt: new Date().toISOString(),
+    draft: summary,
+    stats,
+    contexts: contextDiffs,
+    unreachable,
+  };
+}
+
 module.exports = {
   MAX_PRESSES,
   canonicalPress,
@@ -711,5 +1000,9 @@ module.exports = {
   descendantLeaves,
   conflictGoalId,
   minimumSetCover,
+  analyzeLeaves,
+  listUnreachableCommands,
   generateRegressionSuite,
+  applyDraft,
+  previewSandbox,
 };

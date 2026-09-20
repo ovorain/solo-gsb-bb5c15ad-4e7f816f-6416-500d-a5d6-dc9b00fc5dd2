@@ -3,7 +3,7 @@ const fs = require('node:fs');
 const express = require('express');
 const cors = require('cors');
 const store = require('./store');
-const { computeEffective, evaluateKey, canonicalPress, generateRegressionSuite } = require('./engine');
+const { computeEffective, evaluateKey, canonicalPress, generateRegressionSuite, previewSandbox } = require('./engine');
 
 const app = express();
 app.use(cors());
@@ -103,6 +103,20 @@ app.get('/api/regression-suite', (req, res, next) => {
     next(err);
   }
 });
+
+// ---- 变更沙盒预演（只读：在内存副本上应用草案并对比基线，绝不写回数据文件） ----
+// POST body 即草案：{ adds: [{draftId?, contextId, name, sequence, description?}],
+//                     updates: [{commandId, sequence}], deletes: [commandId, ...] }
+app.post(
+  '/api/sandbox/preview',
+  wrap((req, res) => {
+    const result = previewSandbox(store.snapshot(), req.body || {});
+    if (req.query.download !== undefined) {
+      res.setHeader('Content-Disposition', 'attachment; filename="sandbox-preview.json"');
+    }
+    res.json(result);
+  }),
+);
 
 // ---- 错误处理 ----
 app.use('/api', (err, req, res, next) => {

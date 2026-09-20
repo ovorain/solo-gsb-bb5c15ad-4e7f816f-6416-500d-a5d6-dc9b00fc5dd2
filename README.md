@@ -1,6 +1,6 @@
 # ⌨ 上下文快捷键审校台（Node.js + React）
 
-为命令式快捷键体系提供的可视化审校工具：建立**上下文树**，为命令指定所属上下文与由 **1～3 次按键**组成的序列；选择任一上下文后，系统按**最近祖先规则**构建生效绑定，自动标出**同层重复**与**前缀冲突**，并提供**逐键模拟器**实时查看候选、触发与等待状态。此外可一键**生成回归测试套件**：以全部叶子上下文为候选，用精确集合覆盖选出叶子数量最少的测试上下文集合。
+为命令式快捷键体系提供的可视化审校工具：建立**上下文树**，为命令指定所属上下文与由 **1～3 次按键**组成的序列；选择任一上下文后，系统按**最近祖先规则**构建生效绑定，自动标出**同层重复**与**前缀冲突**，并提供**逐键模拟器**实时查看候选、触发与等待状态。此外可一键**生成回归测试套件**：以全部叶子上下文为候选，用精确集合覆盖选出叶子数量最少的测试上下文集合。新增的**变更沙盒**支持把命令的新增、改序列、删除先暂存为浏览器本地草案，后端在同一份草案上预演基线与模拟状态，按上下文汇总各项差异，改动确认前不触碰任何真实数据。
 
 ## 一条命令启动（Docker Compose）
 
@@ -35,7 +35,7 @@ npm run dev          # 并行启动后端(3000) 与 Vite 前端(5173)
 ```bash
 npm run build        # 构建前端到 client/dist
 npm start            # 仅启动后端；若已 build，则由后端在 3000 端口托管前端
-npm run test:engine  # 运行引擎单测（最近祖先 / 覆盖 / 重复 / 前缀 / 逐键模拟 / 回归套件）
+npm run test:engine  # 运行引擎单测（最近祖先 / 覆盖 / 重复 / 前缀 / 逐键模拟 / 回归套件 / 沙盒预演）
 ```
 
 ## 数据模型
@@ -87,6 +87,28 @@ npm run test:engine  # 运行引擎单测（最近祖先 / 覆盖 / 重复 / 前
 
 页面顶部展示覆盖统计（叶子数、入选数、已覆盖/可触发命令、不可触发命令、两类冲突数、目标覆盖率、输入序列总数），可一键**下载 JSON**（与 `GET /api/regression-suite` 返回内容一致）。
 
+## 变更沙盒（草案预演）
+
+顶部切换到「🛠 变更沙盒」页，可以在**不改动真实数据**的前提下评估一批命令变更的影响：
+
+1. **暂存草案**：基于当前状态批量暂存命令的**新增**、**改序列**、**删除**。草案只保存在浏览器
+   `localStorage`（键 `shortcut-sandbox-draft-v1`）——**既不写入数据文件，也不影响审校页**；
+   刷新或重开页面草案仍在，可逐条撤销或一键**清空草案**。若数据在别处被改动导致草案操作失效
+   （目标命令/上下文已不存在），页面会提示并自动剔除。
+2. **预演**：草案非空时自动调用 `POST /api/sandbox/preview`（也可手动重新预演）。后端在同一份草案上
+   分别计算**基线**（当前状态）与**模拟状态**（应用草案后的内存副本，绝不写回），复用与审校页完全
+   相同的生效规则，按上下文汇总以下各项的**新增 / 消失**：
+   - **生效绑定**（以「命令 + 序列」配对：改序列表现为旧绑定消失、新绑定出现）；
+   - **shadowed**（被更近祖先同序列绑定覆盖的条目）；
+   - **duplicate / prefix 冲突**（以**参与命令集合**的稳定身份配对：参与集合与角色不变的冲突
+     不计差异；集合变化则旧身份消失、新身份出现）；
+   - **不可触发命令**（全局汇总：任何叶子都无法触发的命令，附原因）。
+3. **差异展示**：每项差异都给出**来源路径**（定义所在上下文路径）与**最短触发输入**，草案引入的
+   条目带有「草案新增 / 改序列 / 删除」标记；绿色 ＋ 表示新增、红色 − 表示消失。
+4. **导出**：可一键**下载预演 JSON**（与 `POST /api/sandbox/preview` 返回内容一致）。
+
+预演结果完全确定：全部输出按稳定键排序，与数据文件中的顺序、草案操作的先后顺序无关。
+
 ## HTTP API
 
 | 方法 | 路径 | 说明 |
@@ -97,6 +119,54 @@ npm run test:engine  # 运行引擎单测（最近祖先 / 覆盖 / 重复 / 前
 | GET | `/api/review/:contextId` | 生效绑定、祖先链、冲突清单、shadowed 绑定 |
 | POST | `/api/simulate/:contextId` | 逐键模拟，body：`{"buffer":["g","d"]}` 或 `{"presses":"g d"}` |
 | GET | `/api/regression-suite` | 回归套件（统计 + 入选用例 + 候选覆盖数 + 不可触发命令原因）；加 `?download=1` 返回 `Content-Disposition: attachment` 响应头 |
+| POST | `/api/sandbox/preview` | 变更沙盒预演（只读，不写数据文件）：body 为草案，返回基线 vs 模拟状态的按上下文差异；加 `?download=1` 返回附件响应头 |
+
+`POST /api/sandbox/preview` 请求体（三类操作均可选，默认为空）：
+
+```jsonc
+{
+  "adds":    [ { "draftId": "draft-x1", "contextId": "ctx-terminal", "name": "新命令", "sequence": "g w", "description": "" } ],
+  "updates": [ { "commandId": "cmd-16", "sequence": "g l l" } ],   // 仅改序列
+  "deletes": [ "cmd-10" ]                                          // 命令 id 数组
+}
+```
+
+返回结构：
+
+```jsonc
+{
+  "generatedAt": "…",
+  "draft": { "adds": 1, "updates": 1, "deletes": 1,
+             "addedCommandIds": ["draft-x1"], "updatedCommandIds": ["cmd-16"], "deletedCommandIds": ["cmd-10"] },
+  "stats": {
+    "contextCount": 4, "changedContextCount": 2,
+    "effectiveAppeared": 3, "effectiveDisappeared": 2,
+    "shadowedAppeared": 0, "shadowedDisappeared": 1,
+    "duplicateAppeared": 1, "duplicateDisappeared": 0,
+    "prefixAppeared": 4, "prefixDisappeared": 4,
+    "unreachableAppeared": 0, "unreachableDisappeared": 1,
+    "totalChanges": 16
+  },
+  "contexts": [                      // 仅列出有变化的上下文，按路径排序
+    {
+      "contextId": "ctx-terminal",
+      "contextPath": "App / Editor / Terminal",
+      "changeCount": 8,
+      "effective": { "appeared": [ /* 绑定条目 */ ], "disappeared": [] },
+      "shadowed":  { "appeared": [], "disappeared": [] },
+      "duplicate": { "appeared": [ /* 冲突条目 */ ], "disappeared": [] },
+      "prefix":    { "appeared": [], "disappeared": [] }
+    }
+  ],
+  "unreachable": { "appeared": [ /* 不可触发命令（含原因） */ ], "disappeared": [] }
+}
+```
+
+- **绑定条目**：`commandId, name, contextPath（来源路径）, sequenceLabel, shortestLabel（最短触发输入）, state, draftOp（草案来源标记）`；
+- **冲突条目**：与 `/api/review` 的 conflicts 结构一致，另附 `goalId`（参与命令集合的稳定身份），
+  参与方按命令 id 排序并各带来源路径与最短触发输入。
+
+草案非法（序列不合法、命令/上下文不存在、重复操作、改已删除命令等）时返回 `400` 与错误说明，不产生任何副作用。
 
 `/api/regression-suite` 返回结构：
 
@@ -146,8 +216,8 @@ npm run test:engine  # 运行引擎单测（最近祖先 / 覆盖 / 重复 / 前
 ├── docker-compose.yml        # 一条命令启动，端口 3000，命名卷持久化
 ├── server/
 │   ├── src/
-│   │   ├── index.js          # Express 入口、API、静态托管
-│   │   ├── engine.js         # 核心规则：最近祖先/冲突/逐键模拟/回归套件（精确集合覆盖）
+│   │   ├── index.js          # Express 入口、API（含沙盒预演）、静态托管
+│   │   ├── engine.js         # 核心规则：最近祖先/冲突/逐键模拟/回归套件（精确集合覆盖）/沙盒预演
 │   │   ├── store.js          # JSON 文件持久化 + 校验
 │   │   └── seed.js           # 初始演示数据
 │   └── test/engine.test.js   # 引擎单测
@@ -156,6 +226,6 @@ npm run test:engine  # 运行引擎单测（最近祖先 / 覆盖 / 重复 / 前
     │   ├── App.jsx
     │   ├── api.js
     │   ├── styles.css
-    │   └── components/       # 上下文树 / 命令面板 / 绑定与冲突 / 逐键模拟器 / 回归套件
+    │   └── components/       # 上下文树 / 命令面板 / 绑定与冲突 / 逐键模拟器 / 回归套件 / 变更沙盒
     └── vite.config.js
 ```
