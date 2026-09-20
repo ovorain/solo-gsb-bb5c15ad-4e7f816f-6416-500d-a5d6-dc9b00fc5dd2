@@ -5,6 +5,7 @@ import CommandsPanel from './components/CommandsPanel';
 import BindingsPanel from './components/BindingsPanel';
 import KeySimulator from './components/KeySimulator';
 import RegressionSuite from './components/RegressionSuite';
+import Sandbox from './components/Sandbox';
 
 export default function App() {
   const [state, setState] = useState({ contexts: [], commands: [] });
@@ -12,7 +13,7 @@ export default function App() {
   const [review, setReview] = useState(null);
   const [globalError, setGlobalError] = useState('');
   const [loading, setLoading] = useState(true);
-  const [view, setView] = useState('review'); // review | regression
+  const [view, setView] = useState('review'); // review | regression | sandbox
 
   const refresh = useCallback(async () => {
     const s = await api.getState();
@@ -127,6 +128,12 @@ export default function App() {
           >
             🧪 回归套件生成
           </button>
+          <button
+            className={view === 'sandbox' ? 'tab active' : 'tab'}
+            onClick={() => setView('sandbox')}
+          >
+            🧱 变更沙盒
+          </button>
         </nav>
       </header>
 
@@ -135,6 +142,10 @@ export default function App() {
       {view === 'regression' ? (
         <div className="regression-layout">
           <RegressionSuite />
+        </div>
+      ) : view === 'sandbox' ? (
+        <div className="regression-layout">
+          <Sandbox />
         </div>
       ) : (
         <div className="layout">

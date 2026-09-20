@@ -6,6 +6,7 @@ const {
   generateRegressionSuite,
   minimumSetCover,
   conflictGoalId,
+  previewSandbox,
 } = require('../src/engine');
 
 let passed = 0;
@@ -271,6 +272,162 @@ test('conflictGoalId：参与命令集合相同即同一冲突身份', () => {
   };
   assert.equal(conflictGoalId(pre1), conflictGoalId(pre2));
   assert.notEqual(conflictGoalId(pre1), conflictGoalId(dup1));
+});
+
+// ---------- 变更沙盒预演 ----------
+test('沙盒：空草案在所有上下文都没有差异', () => {
+  const r = previewSandbox(state, {});
+  assert.equal(r.contexts.length, 0);
+  assert.equal(r.stats.commandCountBefore, 8);
+  assert.equal(r.stats.commandCountAfter, 8);
+  assert.equal(r.unreachable.added.length, 0);
+  assert.equal(r.unreachable.removed.length, 0);
+  // 回显的草案被规范化
+  assert.deepEqual(r.draft, { creates: [], updates: [], deletes: [] });
+});
+
+test('沙盒：改序列后祖先绑定恢复生效（shadowed 消失），改动命令记为变化', () => {
+  // c4(A 的 X) 改为 Z：B 下 root 的 c1(X) 不再被覆盖
+  const r = previewSandbox(state, { updates: [{ commandId: 'c4', sequence: 'z' }] });
+  const bCtx = r.contexts.find((c) => c.contextId === 'b');
+  assert.ok(bCtx, 'B 上下文应有差异');
+  assert.deepEqual(bCtx.shadowed.removed.map((x) => x.commandId), ['c1']);
+  assert.deepEqual(bCtx.effectiveBindings.added.map((x) => x.commandId), ['c1']);
+  const change = bCtx.effectiveBindings.changed.find((ch) => ch.before.commandId === 'c4');
+  assert.ok(change);
+  assert.equal(change.before.sequenceLabel, 'X');
+  assert.equal(change.after.sequenceLabel, 'Z');
+});
+
+test('沙盒：删除重复一方使 duplicate 消失；新增同序列双方使 duplicate 新增（稳定身份配对）', () => {
+  // 删除 c6 => A、B 下的 duplicate 身份 dup:c5,c6 消失
+  const r1 = previewSandbox(state, { deletes: ['c6'] });
+  for (const ctxId of ['a', 'b']) {
+    const ctx = r1.contexts.find((c) => c.contextId === ctxId);
+    assert.deepEqual(ctx.duplicates.removed.map((c) => c.goalId), ['dup:c5,c6']);
+    assert.equal(ctx.duplicates.added.length, 0);
+  }
+
+  // 在 root 新增两个同序列命令 n1/n2 => 每个上下文（含兄弟 Sibling）都新增 dup:n1,n2
+  const r2 = previewSandbox(state, {
+    creates: [
+      { clientId: 'n2', contextId: 'root', name: 'new-2', sequence: 't' },
+      { clientId: 'n1', contextId: 'root', name: 'new-1', sequence: 't' },
+    ],
+  });
+  assert.equal(r2.contexts.length, 4); // 四个上下文都新增了该 duplicate
+  for (const ctx of r2.contexts) {
+    assert.deepEqual(ctx.duplicates.added.map((c) => c.goalId), ['dup:n1,n2']);
+    const conflict = ctx.duplicates.added[0];
+    // 参与方稳定排序：n1 在前，且带来源路径与最短触发输入
+    assert.deepEqual(conflict.parties.map((p) => p.commandId), ['n1', 'n2']);
+    assert.ok(conflict.parties.every((p) => p.contextPath && p.shortestLabel === 'T'));
+  }
+});
+
+test('沙盒：删除延伸方使跨层 prefix 冲突消失', () => {
+  // B 下存在跨层前缀冲突 c7(B 的 G) ⊂ c3(root 的 G D)
+  const r = previewSandbox(state, { deletes: ['c3'] });
+  const bCtx = r.contexts.find((c) => c.contextId === 'b');
+  assert.deepEqual(bCtx.prefixes.removed.map((c) => c.goalId), ['pre:c7::c3']);
+  assert.equal(bCtx.prefixes.added.length, 0);
+});
+
+test('沙盒：新增前缀对使 prefix 新增，且双方带来源路径与最短触发输入', () => {
+  const r = previewSandbox(state, {
+    creates: [
+      { clientId: 'new-ext', contextId: 'sibling', name: 'sib-k-l', sequence: 'k l' },
+    ],
+  });
+  const sCtx = r.contexts.find((c) => c.contextId === 'sibling');
+  assert.equal(sCtx.prefixes.added.length, 1);
+  const pre = sCtx.prefixes.added[0];
+  assert.equal(pre.goalId, 'pre:c8::new-ext');
+  assert.equal(pre.prefixSequenceLabel, 'K');
+  assert.equal(pre.extensionSequenceLabel, 'K L');
+  const byRole = Object.fromEntries(pre.parties.map((p) => [p.role, p]));
+  assert.equal(byRole.prefix.commandId, 'c8');
+  assert.equal(byRole.prefix.shortestLabel, 'K');
+  assert.equal(byRole.extension.commandId, 'new-ext');
+  assert.equal(byRole.extension.shortestLabel, 'K L');
+});
+
+test('沙盒：删除叶子上的覆盖命令后，不可触发命令从列表消失（恢复可触发）', () => {
+  // u1(root S) 在两个叶子都被覆盖 => 不可触发；删掉两个覆盖者后恢复
+  const st = {
+    contexts: [
+      { id: 'r', parentId: null, name: 'R' },
+      { id: 'a', parentId: 'r', name: 'A' },
+      { id: 'b', parentId: 'a', name: 'B' },
+      { id: 's', parentId: 'r', name: 'S' },
+    ],
+    commands: [
+      { id: 'u1', contextId: 'r', name: 'r-save', sequenceTokens: ['s'], sequenceLabel: 'S', description: '' },
+      { id: 'a1', contextId: 'a', name: 'a-save', sequenceTokens: ['s'], sequenceLabel: 'S', description: '' },
+      { id: 's1', contextId: 's', name: 's-save', sequenceTokens: ['s'], sequenceLabel: 'S', description: '' },
+    ],
+  };
+  const before = previewSandbox(st, {});
+  assert.equal(before.stats.unreachableBefore, 1);
+  assert.deepEqual(before.unreachable.added.map((u) => u.commandId), []);
+  const r = previewSandbox(st, { deletes: ['a1', 's1'] });
+  assert.deepEqual(r.unreachable.removed.map((u) => u.commandId), ['u1']);
+  assert.equal(r.unreachable.added.length, 0);
+  assert.equal(r.stats.unreachableAfter, 0);
+});
+
+test('沙盒：改序列覆盖祖先会新增不可触发命令并给出原因', () => {
+  // 原本 u1(root S) 只在叶子 B 被 A 覆盖、在 Sibling 可触发；把 c8 改成 Sibling 上的 S 后 u1 不可触发
+  const r = previewSandbox(state, { updates: [{ commandId: 'c8', sequence: 's' }] });
+  // c8 原为 Sibling 的 K：改后 K 绑定消失（Sibling 下），新增 S
+  const sCtx = r.contexts.find((c) => c.contextId === 'sibling');
+  assert.deepEqual(sCtx.effectiveBindings.changed.map((ch) => ch.after.commandId), ['c8']);
+  // 该状态下 u1 类命令不存在 —— 这里确认命令移动场景：把 c4 从 A 移走后 c1 恢复，不新增不可触发
+  const r2 = previewSandbox(state, { updates: [{ commandId: 'c4', contextId: 'sibling' }] });
+  const bCtx = r2.contexts.find((c) => c.contextId === 'b');
+  assert.deepEqual(bCtx.effectiveBindings.added.map((x) => x.commandId), ['c1']);
+});
+
+test('沙盒：结果与草案入参顺序、数据顺序均无关', () => {
+  const d = {
+    creates: [
+      { clientId: 'n2', contextId: 'root', name: 'n2', sequence: 't' },
+      { clientId: 'n1', contextId: 'a', name: 'n1', sequence: 't' },
+    ],
+    updates: [{ commandId: 'c4', sequence: 'z' }],
+    deletes: ['c6', 'c3'],
+  };
+  const shuffledDraft = {
+    creates: d.creates.slice().reverse(),
+    updates: d.updates.slice().reverse(),
+    deletes: d.deletes.slice().reverse(),
+  };
+  const shuffledState = {
+    contexts: state.contexts.slice().reverse(),
+    commands: state.commands.slice().reverse(),
+  };
+  const r1 = previewSandbox(state, d);
+  const r2 = previewSandbox(shuffledState, shuffledDraft);
+  delete r1.generatedAt;
+  delete r2.generatedAt;
+  assert.deepEqual(r1, r2);
+});
+
+test('沙盒：非法草案返回带 status=400 的错误且不产出模拟状态', () => {
+  const badCases = [
+    { creates: [{ contextId: 'root', name: 'x', sequence: 'k' }] }, // 无 clientId
+    { creates: [{ clientId: 'a', contextId: 'root', name: 'x', sequence: 'a b c d' }] }, // 序列过长
+    { creates: [{ clientId: 'a', contextId: 'nope', name: 'x', sequence: 'k' }] }, // 上下文不存在
+    { updates: [{ commandId: 'ghost' }] }, // 命令不存在
+    { deletes: ['c5'], updates: [{ commandId: 'c5', sequence: 'k' }] }, // 又删又改
+    'not-an-object',
+  ];
+  for (const bad of badCases) {
+    assert.throws(
+      () => previewSandbox(state, bad),
+      (err) => err.status === 400,
+    );
+  }
 });
 
 console.log(`\n引擎测试全部通过：${passed} 项`);

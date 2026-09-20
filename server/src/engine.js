@@ -518,28 +518,22 @@ function minimumSetCover(candidates, universe) {
 }
 
 /**
- * 回归套件生成：
- * 1. 以全部叶子上下文为候选，复用 computeEffective 的生效规则；
- * 2. 测试目标 = 每条可在某个叶子触发的命令 + 每个可在某个叶子观察到的
- *    同层重复（duplicate）/ 前缀冲突（prefix），冲突以参与命令集合判定身份；
- * 3. 精确集合覆盖选出叶子数量最少的套件，同解按上下文路径字典序稳定选择；
- * 4. 任何叶子都无法触发的命令列入 unreachableCommands 并给出原因，不计入覆盖。
+ * 收集命令在全部叶子上下文的可触发性（回归套件与变更沙盒预演共用）：
+ * - triggerable：至少在一个叶子生效（非 shadowed）的命令 id 集合
+ * - unreachable：任何叶子都无法触发的命令及原因（shadowed 时给出全部覆盖位置）
  */
-function generateRegressionSuite(state) {
+function collectTriggerability(state) {
   const index = buildIndex(state.contexts);
   const leaves = [...index.byId.values()]
     .filter((c) => c.children.length === 0)
     .map((c) => ({ id: c.id, path: contextPath(index, c.id) }))
     .sort((a, b) => (a.path === b.path ? (a.id < b.id ? -1 : 1) : a.path < b.path ? -1 : 1));
 
-  // 每个叶子跑一次现有审校规则
-  const reviews = leaves.map((leaf) => ({ leaf, eff: computeEffective(state, leaf.id) }));
-
   const triggerLeafIds = new Map(); // commandId -> 可触发它的叶子 id 列表
   const shadowerCounter = new Map(); // commandId -> Map(覆盖者 contextId -> 叶子数)
-  const conflictGoals = new Map(); // goalId -> 冲突对象（代表）
 
-  for (const { leaf, eff } of reviews) {
+  for (const leaf of leaves) {
+    const eff = computeEffective(state, leaf.id);
     for (const e of eff.entries) {
       if (e.state === 'shadowed') {
         if (e.shadowedBy) {
@@ -553,14 +547,9 @@ function generateRegressionSuite(state) {
         triggerLeafIds.get(e.commandId).push(leaf.id);
       }
     }
-    for (const c of eff.conflicts) {
-      const goalId = conflictGoalId(c);
-      if (!conflictGoals.has(goalId)) conflictGoals.set(goalId, c);
-    }
   }
 
-  // 不可触发命令：不在任何叶子生效的命令，单列原因且不计入覆盖目标
-  const unreachableCommands = [];
+  const unreachable = [];
   for (const cmd of state.commands) {
     if (triggerLeafIds.has(cmd.id)) continue;
     const leavesUnder = descendantLeaves(index, cmd.contextId);
@@ -582,7 +571,7 @@ function generateRegressionSuite(state) {
         reason = '该命令未出现在任何叶子上下文的生效绑定中，无法从叶子上下文触发';
       }
     }
-    unreachableCommands.push({
+    unreachable.push({
       commandId: cmd.id,
       name: cmd.name,
       description: cmd.description || '',
@@ -594,7 +583,7 @@ function generateRegressionSuite(state) {
       shadowedBy,
     });
   }
-  unreachableCommands.sort((a, b) =>
+  unreachable.sort((a, b) =>
     a.contextPath === b.contextPath
       ? a.sequenceLabel.localeCompare(b.sequenceLabel) || (a.commandId < b.commandId ? -1 : 1)
       : a.contextPath < b.contextPath
@@ -602,9 +591,35 @@ function generateRegressionSuite(state) {
         : 1,
   );
 
+  return { leaves, triggerable: new Set(triggerLeafIds.keys()), unreachable };
+}
+
+/**
+ * 回归套件生成：
+ * 1. 以全部叶子上下文为候选，复用 computeEffective 的生效规则；
+ * 2. 测试目标 = 每条可在某个叶子触发的命令 + 每个可在某个叶子观察到的
+ *    同层重复（duplicate）/ 前缀冲突（prefix），冲突以参与命令集合判定身份；
+ * 3. 精确集合覆盖选出叶子数量最少的套件，同解按上下文路径字典序稳定选择；
+ * 4. 任何叶子都无法触发的命令列入 unreachableCommands 并给出原因，不计入覆盖。
+ */
+function generateRegressionSuite(state) {
+  const { leaves, triggerable, unreachable: unreachableCommands } = collectTriggerability(state);
+
+  // 每个叶子跑一次现有审校规则
+  const reviews = leaves.map((leaf) => ({ leaf, eff: computeEffective(state, leaf.id) }));
+
+  const conflictGoals = new Map(); // goalId -> 冲突对象（代表）
+
+  for (const { eff } of reviews) {
+    for (const c of eff.conflicts) {
+      const goalId = conflictGoalId(c);
+      if (!conflictGoals.has(goalId)) conflictGoals.set(goalId, c);
+    }
+  }
+
   // 覆盖目标全集：可触发命令 + 叶子可见冲突
   const universe = new Set();
-  for (const id of triggerLeafIds.keys()) universe.add(`cmd:${id}`);
+  for (const id of triggerable) universe.add(`cmd:${id}`);
   for (const id of conflictGoals.keys()) universe.add(id);
 
   // 候选叶子及其覆盖的目标集合
@@ -668,7 +683,7 @@ function generateRegressionSuite(state) {
       candidateCount: candidates.length,
       selectedContextCount: suite.length,
       commandCount: state.commands.length,
-      triggerableCommandCount: triggerLeafIds.size,
+      triggerableCommandCount: triggerable.size,
       coveredCommandCount,
       unreachableCommandCount: unreachableCommands.length,
       conflictCount: conflictGoals.size,
@@ -697,6 +712,450 @@ function pressToPretty(token) {
     .join('+');
 }
 
+// ==================== 变更沙盒（草案预演，只读） ====================
+
+function badRequest(message) {
+  return Object.assign(new Error(message), { status: 400 });
+}
+
+/** 路径字典序比较（相同路径再按 id，保证稳定） */
+function comparePathId(a, b) {
+  if (a.contextPath < b.contextPath) return -1;
+  if (a.contextPath > b.contextPath) return 1;
+  return a.contextId < b.contextId ? -1 : a.contextId > b.contextId ? 1 : 0;
+}
+
+/** 冲突参与方的稳定排序键：duplicate 无 role，prefix 先按角色再按 id */
+function roleRank(role) {
+  if (role === 'prefix') return 0;
+  if (role === 'extension') return 1;
+  return 2;
+}
+
+/**
+ * 规范化并校验草案（纯函数，不触碰数据文件）。
+ * draft: { creates: [{clientId, contextId, name, sequence, description}],
+ *          updates: [{commandId, name?, sequence?, contextId?, description?}],
+ *          deletes: [commandId] }
+ * 返回规范化后的 { creates, updates, deletes }；不合法抛 400。
+ */
+function normalizeDraft(state, raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw badRequest('草案必须是一个对象');
+  const { creates: rawCreates, updates: rawUpdates, deletes: rawDeletes } = raw;
+  if (rawCreates !== undefined && !Array.isArray(rawCreates)) throw badRequest('creates 必须是数组');
+  if (rawUpdates !== undefined && !Array.isArray(rawUpdates)) throw badRequest('updates 必须是数组');
+  if (rawDeletes !== undefined && !Array.isArray(rawDeletes)) throw badRequest('deletes 必须是数组');
+
+  const contextIds = new Set(state.contexts.map((c) => c.id));
+  const existingIds = new Set(state.commands.map((c) => c.id));
+
+  const creates = [];
+  const createClients = new Set();
+  for (const item of rawCreates || []) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) throw badRequest('creates 的每一项必须是对象');
+    const clientId = String(item.clientId == null ? '' : item.clientId).trim();
+    if (!clientId) throw badRequest('新增命令缺少 clientId（草案内的稳定身份）');
+    if (createClients.has(clientId)) throw badRequest(`草案中存在重复的新增身份：${clientId}`);
+    if (existingIds.has(clientId)) throw badRequest(`新增身份 ${clientId} 与现有命令 id 冲突`);
+    createClients.add(clientId);
+    const contextId = String(item.contextId == null ? '' : item.contextId);
+    if (!contextIds.has(contextId)) throw badRequest(`新增命令「${clientId}」引用了不存在的上下文：${contextId}`);
+    const name = String(item.name == null ? '' : item.name).trim();
+    if (!name) throw badRequest(`新增命令「${clientId}」名称不能为空`);
+    const sequence = String(item.sequence == null ? '' : item.sequence);
+    const parsed = parseSequence(sequence);
+    if (!parsed.ok) throw badRequest(`新增命令「${name}」的序列不合法：${parsed.error}`);
+    creates.push({
+      op: 'create',
+      clientId,
+      contextId,
+      name,
+      description: String(item.description == null ? '' : item.description),
+      sequenceRaw: sequence,
+      sequenceTokens: parsed.tokens,
+      sequenceLabel: parsed.label,
+    });
+  }
+  creates.sort((a, b) => (a.clientId < b.clientId ? -1 : 1));
+
+  const updates = [];
+  const updateIds = new Set();
+  for (const item of rawUpdates || []) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) throw badRequest('updates 的每一项必须是对象');
+    const commandId = String(item.commandId == null ? '' : item.commandId);
+    if (!commandId) throw badRequest('改序列/改属性缺少 commandId');
+    if (!existingIds.has(commandId)) throw badRequest(`要修改的命令不存在：${commandId}`);
+    if (updateIds.has(commandId)) throw badRequest(`命令 ${commandId} 在草案中出现了多次修改（请合并为一项）`);
+    updateIds.add(commandId);
+
+    const patch = {};
+    if (item.name !== undefined) {
+      const name = String(item.name).trim();
+      if (!name) throw badRequest(`命令 ${commandId} 的新名称不能为空`);
+      patch.name = name;
+    }
+    if (item.description !== undefined) patch.description = String(item.description);
+    if (item.contextId !== undefined) {
+      const contextId = String(item.contextId);
+      if (!contextIds.has(contextId)) throw badRequest(`命令 ${commandId} 要移动到不存在的上下文：${contextId}`);
+      patch.contextId = contextId;
+    }
+    if (item.sequence !== undefined) {
+      const parsed = parseSequence(String(item.sequence));
+      if (!parsed.ok) throw badRequest(`命令 ${commandId} 的新序列不合法：${parsed.error}`);
+      patch.sequenceRaw = String(item.sequence);
+      patch.sequenceTokens = parsed.tokens;
+      patch.sequenceLabel = parsed.label;
+    }
+    updates.push({ op: 'update', commandId, patch });
+  }
+  updates.sort((a, b) => (a.commandId < b.commandId ? -1 : 1));
+
+  const deletes = [];
+  const deleteIds = new Set();
+  for (const rawId of rawDeletes || []) {
+    const commandId = String(rawId == null ? '' : rawId);
+    if (!commandId) throw badRequest('删除列表中存在空命令 id');
+    if (!existingIds.has(commandId)) throw badRequest(`要删除的命令不存在：${commandId}`);
+    if (deleteIds.has(commandId)) throw badRequest(`删除列表中命令 ${commandId} 重复`);
+    deleteIds.add(commandId);
+    deletes.push(commandId);
+  }
+  deletes.sort();
+
+  for (const id of deletes) {
+    if (updateIds.has(id)) throw badRequest(`命令 ${id} 同时被修改和删除（请只保留一种操作）`);
+  }
+
+  return { creates, updates, deletes };
+}
+
+/** 在内存中把规范化草案应用到基线状态，返回模拟状态与操作清单（不写任何文件） */
+function applyDraft(state, draft) {
+  const commands = state.commands.map((c) => ({ ...c }));
+  const byId = new Map(commands.map((c) => [c.id, c]));
+
+  for (const c of draft.creates) {
+    const cmd = {
+      id: c.clientId,
+      contextId: c.contextId,
+      name: c.name,
+      description: c.description,
+      sequenceRaw: c.sequenceRaw,
+      sequenceTokens: [...c.sequenceTokens],
+      sequenceLabel: c.sequenceLabel,
+      _sandboxCreated: true,
+    };
+    commands.push(cmd);
+    byId.set(cmd.id, cmd);
+  }
+  for (const u of draft.updates) {
+    const cmd = byId.get(u.commandId);
+    if (u.patch.name !== undefined) cmd.name = u.patch.name;
+    if (u.patch.description !== undefined) cmd.description = u.patch.description;
+    if (u.patch.contextId !== undefined) cmd.contextId = u.patch.contextId;
+    if (u.patch.sequenceRaw !== undefined) {
+      cmd.sequenceRaw = u.patch.sequenceRaw;
+      cmd.sequenceTokens = [...u.patch.sequenceTokens];
+      cmd.sequenceLabel = u.patch.sequenceLabel;
+    }
+  }
+  const deleteSet = new Set(draft.deletes);
+
+  return {
+    contexts: state.contexts.map((c) => ({ ...c })),
+    commands: commands.filter((c) => !deleteSet.has(c.id)),
+  };
+}
+
+/** 冲突参与方输出（稳定排序，不依赖数据/返回顺序） */
+function conflictPartiesPayload(effConflict) {
+  return effConflict.parties
+    .map((p) => ({
+      commandId: p.commandId,
+      name: p.name,
+      contextId: p.contextId,
+      contextPath: p.contextPath,
+      role: p.role || null,
+      shortestLabel: p.shortestLabel,
+      sequenceLabel: p.sequenceLabel,
+    }))
+    .sort((a, b) => roleRank(a.role) - roleRank(b.role) || (a.commandId < b.commandId ? -1 : 1));
+}
+
+/** 冲突完整载荷（用于新增/消失/仍在但有变化） */
+function conflictPayload(effConflict) {
+  const base = {
+    goalId: conflictGoalId(effConflict),
+    type: effConflict.type,
+    kindLabel: effConflict.kindLabel,
+    parties: conflictPartiesPayload(effConflict),
+  };
+  if (effConflict.type === 'prefix') {
+    return {
+      ...base,
+      prefixSequenceLabel: effConflict.prefixSequenceLabel,
+      extensionSequenceLabel: effConflict.extensionSequenceLabel,
+      prefixTokens: [...effConflict.prefixTokens],
+      extensionTokens: [...effConflict.extensionTokens],
+    };
+  }
+  return {
+    ...base,
+    sequenceLabel: effConflict.sequenceLabel,
+    sequenceTokens: [...effConflict.sequenceTokens],
+  };
+}
+
+/**
+ * 为某份状态的每个上下文收集：
+ *   bindings: 生效绑定 Map(commandId -> 载荷)
+ *   shadows:  shadowed 绑定 Map(commandId -> 载荷)
+ *   conflicts: 冲突 Map(稳定身份 goalId -> 载荷)
+ * 命令 id 是绑定的稳定身份；冲突以参与命令集合作为稳定身份。
+ */
+function collectContextSnapshot(state, index) {
+  const snapshots = new Map();
+  for (const ctx of state.contexts) {
+    const eff = computeEffective(state, ctx.id);
+    const bindings = new Map();
+    const shadows = new Map();
+    for (const e of eff.entries) {
+      const payload = {
+        commandId: e.commandId,
+        name: e.name,
+        contextId: e.contextId,
+        contextPath: e.contextPath,
+        sequenceTokens: [...e.sequenceTokens],
+        sequenceLabel: e.sequenceLabel,
+        shortestLabel: e.sequenceLabel,
+        state: e.state,
+        duplicate: e.duplicate,
+        prefix: e.prefix,
+      };
+      if (e.state === 'shadowed') {
+        payload.shadowedBy = e.shadowedBy;
+        shadows.set(e.commandId, payload);
+      } else {
+        bindings.set(e.commandId, payload);
+      }
+    }
+    const conflicts = new Map();
+    for (const c of eff.conflicts) {
+      conflicts.set(conflictGoalId(c), conflictPayload(c));
+    }
+    snapshots.set(ctx.id, {
+      contextId: ctx.id,
+      contextPath: contextPath(index, ctx.id),
+      bindings,
+      shadows,
+      conflicts,
+    });
+  }
+  return snapshots;
+}
+
+function stableJson(value) {
+  if (Array.isArray(value)) return value.map(stableJson);
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const k of Object.keys(value).sort()) out[k] = stableJson(value[k]);
+    return out;
+  }
+  return value;
+}
+
+/** 载荷签名：参与命令集合 / 来源路径 / 最短触发输入等任一变化都会体现 */
+function payloadSignature(payload) {
+  return JSON.stringify(stableJson(payload));
+}
+
+function comparePayload(kind, a, b) {
+  if (kind === 'bindings' || kind === 'shadows') {
+    return (
+      a.sequenceLabel.localeCompare(b.sequenceLabel) ||
+      comparePathId(a, b) ||
+      (a.commandId < b.commandId ? -1 : a.commandId > b.commandId ? 1 : 0)
+    );
+  }
+  // conflicts：按类型稳定排列，再按身份
+  const ta = a.type === 'duplicate' ? 0 : 1;
+  const tb = b.type === 'duplicate' ? 0 : 1;
+  return ta - tb || (a.goalId < b.goalId ? -1 : a.goalId > b.goalId ? 1 : 0);
+}
+
+/**
+ * 通用差异计算：以稳定身份配对两个 Map，
+ * 输出新增 added / 消失 removed / 身份不变但载荷变化 changed。
+ */
+function diffMaps(baseMap, simMap) {
+  const added = [];
+  const removed = [];
+  const changed = [];
+  for (const [id, payload] of simMap) {
+    const before = baseMap.get(id);
+    if (!before) added.push(payload);
+    else if (payloadSignature(before) !== payloadSignature(payload)) {
+      changed.push({ before, after: payload });
+    }
+  }
+  for (const [id, payload] of baseMap) {
+    if (!simMap.has(id)) removed.push(payload);
+  }
+  return { added, removed, changed };
+}
+
+function sortDiff(kind, diff) {
+  diff.added.sort((a, b) => comparePayload(kind, a, b));
+  diff.removed.sort((a, b) => comparePayload(kind, a, b));
+  diff.changed.sort((a, b) => comparePayload(kind, a.after, b.after));
+}
+
+/**
+ * 变更沙盒预演：在同一份草案上分别计算基线状态与模拟状态，
+ * 按上下文汇总生效绑定 / shadowed / duplicate / prefix 的新增与消失，
+ * 并给出全局不可触发命令的新增与消失。所有结果使用稳定身份配对，
+ * 排序确定，不受数据顺序或入参数组顺序影响。只读，不写数据文件。
+ */
+function previewSandbox(state, rawDraft) {
+  const draft = normalizeDraft(state, rawDraft);
+  const simulated = applyDraft(state, draft);
+
+  const baseIndex = buildIndex(state.contexts);
+  const simIndex = buildIndex(simulated.contexts);
+  const baseSnap = collectContextSnapshot(state, baseIndex);
+  const simSnap = collectContextSnapshot(simulated, simIndex);
+
+  const contexts = [];
+  const totals = {
+    bindingsAdded: 0,
+    bindingsRemoved: 0,
+    bindingsChanged: 0,
+    shadowsAdded: 0,
+    shadowsRemoved: 0,
+    duplicateAdded: 0,
+    duplicateRemoved: 0,
+    duplicateChanged: 0,
+    prefixAdded: 0,
+    prefixRemoved: 0,
+    prefixChanged: 0,
+  };
+
+  // 上下文身份以 id 为准（草案不支持改上下文树）；路径用模拟状态（命名相同）
+  for (const ctx of simulated.contexts) {
+    const before = baseSnap.get(ctx.id);
+    const after = simSnap.get(ctx.id);
+    const bindingDiff = diffMaps(before.bindings, after.bindings);
+    const shadowDiff = diffMaps(before.shadows, after.shadows);
+    const conflictDiff = diffMaps(before.conflicts, after.conflicts);
+    sortDiff('bindings', bindingDiff);
+    sortDiff('shadows', shadowDiff);
+    sortDiff('conflicts', conflictDiff);
+
+    const dupAdded = conflictDiff.added.filter((c) => c.type === 'duplicate');
+    const dupRemoved = conflictDiff.removed.filter((c) => c.type === 'duplicate');
+    const dupChanged = conflictDiff.changed.filter((ch) => ch.after.type === 'duplicate');
+    const preAdded = conflictDiff.added.filter((c) => c.type === 'prefix');
+    const preRemoved = conflictDiff.removed.filter((c) => c.type === 'prefix');
+    const preChanged = conflictDiff.changed.filter((ch) => ch.after.type === 'prefix');
+
+    const hasDiff =
+      bindingDiff.added.length +
+        bindingDiff.removed.length +
+        bindingDiff.changed.length +
+        shadowDiff.added.length +
+        shadowDiff.removed.length +
+        conflictDiff.added.length +
+        conflictDiff.removed.length +
+        conflictDiff.changed.length >
+      0;
+    if (!hasDiff) continue;
+
+    totals.bindingsAdded += bindingDiff.added.length;
+    totals.bindingsRemoved += bindingDiff.removed.length;
+    totals.bindingsChanged += bindingDiff.changed.length;
+    totals.shadowsAdded += shadowDiff.added.length;
+    totals.shadowsRemoved += shadowDiff.removed.length;
+    totals.duplicateAdded += dupAdded.length;
+    totals.duplicateRemoved += dupRemoved.length;
+    totals.duplicateChanged += dupChanged.length;
+    totals.prefixAdded += preAdded.length;
+    totals.prefixRemoved += preRemoved.length;
+    totals.prefixChanged += preChanged.length;
+
+    contexts.push({
+      contextId: ctx.id,
+      contextPath: contextPath(simIndex, ctx.id),
+      effectiveBindings: bindingDiff,
+      shadowed: {
+        added: shadowDiff.added,
+        removed: shadowDiff.removed,
+      },
+      duplicates: { added: dupAdded, removed: dupRemoved, changed: dupChanged },
+      prefixes: { added: preAdded, removed: preRemoved, changed: preChanged },
+    });
+  }
+  contexts.sort(comparePathId);
+
+  // 不可触发命令（全局；上下文树未变更，叶子集合相同）
+  const baseUnreach = collectTriggerability(state).unreachable;
+  const simUnreach = collectTriggerability(simulated).unreachable;
+  const baseUnreachMap = new Map(baseUnreach.map((u) => [u.commandId, u]));
+  const simUnreachMap = new Map(simUnreach.map((u) => [u.commandId, u]));
+  const unreachableAdded = [];
+  const unreachableRemoved = [];
+  for (const [id, payload] of simUnreachMap) {
+    if (!baseUnreachMap.has(id)) unreachableAdded.push(payload);
+  }
+  for (const [id, payload] of baseUnreachMap) {
+    if (!simUnreachMap.has(id)) unreachableRemoved.push(payload);
+  }
+  const cmpUnreachable = (a, b) =>
+    comparePathId(a, b) ||
+    a.sequenceLabel.localeCompare(b.sequenceLabel) ||
+    (a.commandId < b.commandId ? -1 : 1);
+  unreachableAdded.sort(cmpUnreachable);
+  unreachableRemoved.sort(cmpUnreachable);
+
+  return {
+    generatedAt: new Date().toISOString(),
+    draft: {
+      creates: draft.creates.map((c) => ({
+        clientId: c.clientId,
+        contextId: c.contextId,
+        name: c.name,
+        description: c.description,
+        sequenceRaw: c.sequenceRaw,
+        sequenceTokens: c.sequenceTokens,
+        sequenceLabel: c.sequenceLabel,
+      })),
+      updates: draft.updates.map((u) => ({
+        commandId: u.commandId,
+        patch: u.patch,
+      })),
+      deletes: draft.deletes,
+    },
+    stats: {
+      ...totals,
+      contextCount: contexts.length,
+      commandCountBefore: state.commands.length,
+      commandCountAfter: simulated.commands.length,
+      createCount: draft.creates.length,
+      updateCount: draft.updates.length,
+      deleteCount: draft.deletes.length,
+      unreachableBefore: baseUnreach.length,
+      unreachableAfter: simUnreach.length,
+      unreachableAdded: unreachableAdded.length,
+      unreachableRemoved: unreachableRemoved.length,
+    },
+    contexts,
+    unreachable: {
+      added: unreachableAdded,
+      removed: unreachableRemoved,
+    },
+  };
+}
+
 module.exports = {
   MAX_PRESSES,
   canonicalPress,
@@ -712,4 +1171,7 @@ module.exports = {
   conflictGoalId,
   minimumSetCover,
   generateRegressionSuite,
+  collectTriggerability,
+  normalizeDraft,
+  previewSandbox,
 };
